@@ -24,6 +24,7 @@ from opentelemetry.sdk.trace.export import (
 )
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.openai import OpenAIInstrumentor
+from opentelemetry.trace import Status, StatusCode
 
 
 async def _summary_extractor(run_result: RunResult) -> str:
@@ -41,30 +42,31 @@ class FinancialResearchManager:
     def __init__(self) -> None:
         self.console = Console()
         self.printer = Printer(self.console)
-
-    async def run(self, query: str) -> None:
+        
+        # Set up OpenTelemetry tracing.
         resource = Resource.create(
             {
                 "service.name": "FINANCIAL_RESEARCH_AGENT",
                 "service_version": "0.1.0",
-                "deployment.environment" : "development",
+                "deployment.environment": "development",
             }
         )
         provider = TracerProvider(resource=resource)
-        oltp_exporter = OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True)
-        provider.add_span_processor(BatchSpanProcessor(oltp_exporter))
-
+        otlp_exporter = OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True)
+        provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
         otel_trace.set_tracer_provider(provider)
         
-        # Instrument OpenAI to automatically trace all LLM calls
+        # Instrument OpenAI to automatically trace all LLM calls.
         OpenAIInstrumentor(
-            enrich_assistant=True,  # Capture detailed assistant API interactions
-            enable_trace_context_propagation=True,  # Enable distributed tracing
+            enrich_assistant=True,
+            enable_trace_context_propagation=True,
         ).instrument()
         
-        tracer = otel_trace.get_tracer(__name__)
+        self.tracer = otel_trace.get_tracer(__name__)
 
-        with tracer.start_as_current_span("Financial research trace"):
+    async def run(self, query: str) -> None:
+        with self.tracer.start_as_current_span("financial_research.run") as span:
+            span.set_attribute("query", query)
             self.printer.update_item(
                 "trace_id",
                 "Financial research trace started",
@@ -91,75 +93,103 @@ class FinancialResearchManager:
         print(verification)
 
     async def _plan_searches(self, query: str) -> FinancialSearchPlan:
-        self.printer.update_item("planning", "Planning searches...")
-        result = await Runner.run(planner_agent, f"Query: {query}")
-        self.printer.update_item(
-            "planning",
-            f"Will perform {len(result.final_output.searches)} searches",
-            is_done=True,
-        )
-        return result.final_output_as(FinancialSearchPlan)
+        with self.tracer.start_as_current_span("financial_research.plan_searches") as span:
+            span.set_attribute("query", query)
+            span.set_attribute("agent_model", planner_agent.model)
+            self.printer.update_item("planning", "Planning searches...")
+            result = await Runner.run(planner_agent, f"Query: {query}")
+            plan = result.final_output_as(FinancialSearchPlan)
+            span.set_attribute("num_searches_planned", len(plan.searches))
+            self.printer.update_item(
+                "planning",
+                f"Will perform {len(plan.searches)} searches",
+                is_done=True,
+            )
+            return plan
 
     async def _perform_searches(self, search_plan: FinancialSearchPlan) -> Sequence[str]:
-        tracer = otel_trace.get_tracer(__name__)
-        with tracer.start_as_current_span("Search the web"):
+        with self.tracer.start_as_current_span("financial_research.perform_searches") as span:
+            span.set_attribute("num_searches_total", len(search_plan.searches))
             self.printer.update_item("searching", "Searching...")
             tasks = [asyncio.create_task(self._search(item)) for item in search_plan.searches]
             results: list[str] = []
             num_completed = 0
+            num_failed = 0
             for task in asyncio.as_completed(tasks):
                 result = await task
                 if result is not None:
                     results.append(result)
+                else:
+                    num_failed += 1
                 num_completed += 1
                 self.printer.update_item(
                     "searching", f"Searching... {num_completed}/{len(tasks)} completed"
                 )
+            span.set_attribute("num_searches_completed", len(results))
+            span.set_attribute("num_searches_failed", num_failed)
             self.printer.mark_item_done("searching")
             return results
 
     async def _search(self, item: FinancialSearchItem) -> str | None:
-        input_data = f"Search term: {item.query}\nReason: {item.reason}"
-        try:
-            result = await Runner.run(search_agent, input_data)
-            return str(result.final_output)
-        except Exception:
-            return None
+        with self.tracer.start_as_current_span("financial_research.search") as span:
+            span.set_attribute("search.query", item.query)
+            span.set_attribute("search.reason", item.reason)
+            span.set_attribute("agent_model", search_agent.model)
+            input_data = f"Search term: {item.query}\nReason: {item.reason}"
+            try:
+                result = await Runner.run(search_agent, input_data)
+                span.set_attribute("search.success", True)
+                return str(result.final_output)
+            except Exception as e:
+                span.set_attribute("search.success", False)
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                return None
 
     async def _write_report(self, query: str, search_results: Sequence[str]) -> FinancialReportData:
-        # Expose the specialist analysts as tools so the writer can invoke them inline
-        # and still produce the final FinancialReportData output.
-        fundamentals_tool = financials_agent.as_tool(
-            tool_name="fundamentals_analysis",
-            tool_description="Use to get a short write‑up of key financial metrics",
-            custom_output_extractor=_summary_extractor,
-        )
-        risk_tool = risk_agent.as_tool(
-            tool_name="risk_analysis",
-            tool_description="Use to get a short write‑up of potential red flags",
-            custom_output_extractor=_summary_extractor,
-        )
-        writer_with_tools = writer_agent.clone(tools=[fundamentals_tool, risk_tool])
-        self.printer.update_item("writing", "Thinking about report...")
-        input_data = f"Original query: {query}\nSummarized search results: {search_results}"
-        result = Runner.run_streamed(writer_with_tools, input_data)
-        update_messages = [
-            "Planning report structure...",
-            "Writing sections...",
-            "Finalizing report...",
-        ]
-        last_update = time.time()
-        next_message = 0
-        async for _ in result.stream_events():
-            if time.time() - last_update > 5 and next_message < len(update_messages):
-                self.printer.update_item("writing", update_messages[next_message])
-                next_message += 1
-                last_update = time.time()
-        self.printer.mark_item_done("writing")
-        return result.final_output_as(FinancialReportData)
+        with self.tracer.start_as_current_span("financial_research.write_report") as span:
+            span.set_attribute("query", query)
+            span.set_attribute("num_search_results", len(search_results))
+            span.set_attribute("agent_model", writer_agent.model)
+            # Expose the specialist analysts as tools so the writer can invoke them inline
+            # and still produce the final FinancialReportData output.
+            fundamentals_tool = financials_agent.as_tool(
+                tool_name="fundamentals_analysis",
+                tool_description="Use to get a short write‑up of key financial metrics",
+                custom_output_extractor=_summary_extractor,
+            )
+            risk_tool = risk_agent.as_tool(
+                tool_name="risk_analysis",
+                tool_description="Use to get a short write‑up of potential red flags",
+                custom_output_extractor=_summary_extractor,
+            )
+            writer_with_tools = writer_agent.clone(tools=[fundamentals_tool, risk_tool])
+            self.printer.update_item("writing", "Thinking about report...")
+            input_data = f"Original query: {query}\nSummarized search results: {search_results}"
+            result = Runner.run_streamed(writer_with_tools, input_data)
+            update_messages = [
+                "Planning report structure...",
+                "Writing sections...",
+                "Finalizing report...",
+            ]
+            last_update = time.time()
+            next_message = 0
+            async for _ in result.stream_events():
+                if time.time() - last_update > 5 and next_message < len(update_messages):
+                    self.printer.update_item("writing", update_messages[next_message])
+                    next_message += 1
+                    last_update = time.time()
+            self.printer.mark_item_done("writing")
+            report = result.final_output_as(FinancialReportData)
+            span.set_attribute("report.length", len(report.markdown_report))
+            return report
 
     async def _verify_report(self, report: FinancialReportData) -> VerificationResult:
-        self.printer.update_item("verifying", "Verifying report...")
-        result = await Runner.run(verifier_agent, report.markdown_report)
-        self.printer.mark_item_done("verifying")
-        return result.final_output_as(VerificationResult)
+        with self.tracer.start_as_current_span("financial_research.verify_report") as span:
+            span.set_attribute("agent_model", verifier_agent.model)
+            self.printer.update_item("verifying", "Verifying report...")
+            result = await Runner.run(verifier_agent, report.markdown_report)
+            self.printer.mark_item_done("verifying")
+            verification = result.final_output_as(VerificationResult)
+            span.set_attribute("verification.passed", verification.verified)
+            return verification
