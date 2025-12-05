@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from rich.console import Console
 
-from agents import Runner, RunResult, custom_span, gen_trace_id, trace
+from agents import Runner, RunResult
 
 from .agents.financials_agent import financials_agent
 from .agents.planner_agent import FinancialSearchItem, FinancialSearchPlan, planner_agent
@@ -15,6 +15,15 @@ from .agents.search_agent import search_agent
 from .agents.verifier_agent import VerificationResult, verifier_agent
 from .agents.writer_agent import FinancialReportData, writer_agent
 from .printer import Printer
+
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+)
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.openai import OpenAIInstrumentor
 
 
 async def _summary_extractor(run_result: RunResult) -> str:
@@ -34,11 +43,31 @@ class FinancialResearchManager:
         self.printer = Printer(self.console)
 
     async def run(self, query: str) -> None:
-        trace_id = gen_trace_id()
-        with trace("Financial research trace", trace_id=trace_id):
+        resource = Resource.create(
+            {
+                "service.name": "FINANCIAL_RESEARCH_AGENT",
+                "service_version": "0.1.0",
+                "deployment.environment" : "development",
+            }
+        )
+        provider = TracerProvider(resource=resource)
+        oltp_exporter = OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True)
+        provider.add_span_processor(BatchSpanProcessor(oltp_exporter))
+
+        otel_trace.set_tracer_provider(provider)
+        
+        # Instrument OpenAI to automatically trace all LLM calls
+        OpenAIInstrumentor(
+            enrich_assistant=True,  # Capture detailed assistant API interactions
+            enable_trace_context_propagation=True,  # Enable distributed tracing
+        ).instrument()
+        
+        tracer = otel_trace.get_tracer(__name__)
+
+        with tracer.start_as_current_span("Financial research trace"):
             self.printer.update_item(
                 "trace_id",
-                f"View trace: https://platform.openai.com/traces/trace?trace_id={trace_id}",
+                "Financial research trace started",
                 is_done=True,
                 hide_checkmark=True,
             )
@@ -72,7 +101,8 @@ class FinancialResearchManager:
         return result.final_output_as(FinancialSearchPlan)
 
     async def _perform_searches(self, search_plan: FinancialSearchPlan) -> Sequence[str]:
-        with custom_span("Search the web"):
+        tracer = otel_trace.get_tracer(__name__)
+        with tracer.start_as_current_span("Search the web"):
             self.printer.update_item("searching", "Searching...")
             tasks = [asyncio.create_task(self._search(item)) for item in search_plan.searches]
             results: list[str] = []
